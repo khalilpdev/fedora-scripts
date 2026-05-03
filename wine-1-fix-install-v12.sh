@@ -64,7 +64,7 @@ check_wine_installed() {
         CURRENT_WINE=$(wine --version 2>/dev/null | head -1)
         log_info "Wine atual: $CURRENT_WINE"
         
-        if [[ "$CURRENT_WINE" == *"staging 11.0"* ]]; then
+        if [[ "$CURRENT_WINE" == *"11.0"* && "$CURRENT_WINE" =~ [Ss]taging ]]; then
             log_warning "Versão problemática (staging 11.0) detectada!"
             return 0
         else
@@ -84,6 +84,13 @@ check_wine_installed() {
 # Backup do prefixo Wine
 backup_wine_prefix() {
     if [ -d "$HOME/.wine" ]; then
+        read -p "Deseja fazer backup da pasta ~/.wine antes de continuar? (s/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Ss]$ ]]; then
+            log_info "Backup da pasta ~/.wine ignorado por escolha do usuário"
+            return 0
+        fi
+
         BACKUP_DIR="$HOME/.wine.backup.$(date +%Y%m%d_%H%M%S)"
         log_info "Fazendo backup do prefixo Wine para: $BACKUP_DIR"
         mv "$HOME/.wine" "$BACKUP_DIR"
@@ -91,6 +98,18 @@ backup_wine_prefix() {
     else
         log_info "Nenhum prefixo Wine encontrado para backup"
     fi
+}
+
+# Retorna sucesso (0) se a versão problemática estiver ativa
+is_problematic_wine() {
+    local version
+    version=$(wine --version 2>/dev/null | head -1)
+
+    if [[ "$version" == *"11.0"* && "$version" =~ [Ss]taging ]]; then
+        return 0
+    fi
+
+    return 1
 }
 
 # Método 1: Instalar Wine corrigido via WineHQ
@@ -106,23 +125,47 @@ install_wine_corrected() {
     # Atualiza cache
     sudo dnf makecache
     
-    # Remove versões antigas problemáticas
+    # Remove versões antigas problemáticas (pacotes Fedora e WineHQ)
     log_info "Removendo versões antigas do Wine..."
-    sudo dnf remove -y wine-staging wine-stable winehq-staging winehq-stable 2>/dev/null || true
+    sudo dnf remove -y 'wine*' 'winehq*' 2>/dev/null || true
     
     # Instala versão estável mais recente (recomendada)
     log_info "Instalando WineHQ Stable (versão corrigida)..."
-    sudo dnf install -y winehq-stable
+    if ! sudo dnf install -y winehq-stable; then
+        log_warning "Falha ao instalar winehq-stable. Tentando winehq-devel..."
+        sudo dnf install -y winehq-devel
+    fi
     
     # Verifica instalação
     if command -v wine &> /dev/null; then
         NEW_VERSION=$(wine --version 2>/dev/null | head -1)
         log_success "Wine instalado: $NEW_VERSION"
         
-        # Verifica se a versão é > 11.0
+        # Verifica se a versão não é a problemática 11.0
         if [[ "$NEW_VERSION" =~ ([0-9]+)\.([0-9]+) ]]; then
             MAJOR=${BASH_REMATCH[1]}
             MINOR=${BASH_REMATCH[2]}
+
+            # Se caiu na 11.0 Staging, tenta trocar para devel automaticamente
+            if is_problematic_wine; then
+                log_warning "Wine 11.0 detectado após instalação. Tentando WineHQ Devel..."
+                sudo dnf remove -y 'wine*' 'winehq*' 2>/dev/null || true
+                sudo dnf install -y winehq-devel
+
+                NEW_VERSION=$(wine --version 2>/dev/null | head -1)
+                log_info "Versão após fallback para Devel: $NEW_VERSION"
+
+                if [[ "$NEW_VERSION" =~ ([0-9]+)\.([0-9]+) ]]; then
+                    MAJOR=${BASH_REMATCH[1]}
+                    MINOR=${BASH_REMATCH[2]}
+                fi
+            fi
+
+            if is_problematic_wine; then
+                log_warning "Versão problemática ainda ativa: $NEW_VERSION"
+                return 1
+            fi
+
             if [ "$MAJOR" -gt 11 ] || ([ "$MAJOR" -eq 11 ] && [ "$MINOR" -gt 0 ]); then
                 log_success "Versão corrigida instalada com sucesso!"
                 return 0
@@ -135,6 +178,93 @@ install_wine_corrected() {
         log_error "Falha na instalação do Wine"
         return 1
     fi
+}
+
+# Método 1.5: Tenta instalar Wine 10.x automaticamente
+install_wine_10_fallback() {
+    local version
+    local candidate
+    local has_candidate
+    local compat_version
+
+    log_info "Tentando instalar Wine 10.x automaticamente..."
+
+    # Garante que o repositório WineHQ esteja configurado
+    if [ ! -f /etc/yum.repos.d/winehq.repo ]; then
+        log_info "Adicionando repositório WineHQ para buscar Wine 10.x..."
+        sudo dnf config-manager --add-repo "https://dl.winehq.org/wine-builds/fedora/$FEDORA_VERSION/winehq.repo"
+    fi
+
+    sudo dnf makecache
+
+    # Remove qualquer Wine instalado para evitar conflito de dependências
+    sudo dnf remove -y 'wine*' 'winehq*' 2>/dev/null || true
+
+    # Tenta padrões de pacotes 10.x, do mais específico ao mais amplo
+    for candidate in 'winehq-stable-10*' 'winehq-devel-10*' 'wine-10*'; do
+        has_candidate=$(dnf -q list --available "$candidate" 2>/dev/null | grep -E '^wine' | head -n 1 || true)
+        if [ -z "$has_candidate" ]; then
+            continue
+        fi
+
+        log_info "Tentando instalar pacote: $candidate"
+        if sudo dnf install -y --allowerasing --skip-unavailable "$candidate"; then
+            if command -v wine &> /dev/null; then
+                version=$(wine --version 2>/dev/null | head -1)
+                log_info "Versão detectada após tentativa: $version"
+
+                if [[ "$version" =~ ^wine-10\. ]]; then
+                    log_success "Wine 10.x instalado com sucesso!"
+                    return 0
+                fi
+            fi
+        fi
+    done
+
+    # Plano B: tenta devel sem fixar major, caso 10.x não exista no repositório
+    log_warning "Nenhum pacote 10.x disponível nos repositórios atuais. Tentando winehq-devel..."
+    if sudo dnf install -y --allowerasing winehq-devel; then
+        if command -v wine &> /dev/null; then
+            version=$(wine --version 2>/dev/null | head -1)
+            log_info "Versão detectada após plano B (devel): $version"
+            if ! is_problematic_wine; then
+                log_success "Wine alternativo instalado com sucesso (winehq-devel)."
+                return 0
+            fi
+        fi
+    fi
+
+    # Plano C: os pacotes WineHQ compilados contra FFmpeg 6.x não instalam no Fedora 44+
+    # (libavcodec.so.61 não existe, só libavcodec.so.62+). Usamos Flatpak como último
+    # recurso — ele traz suas próprias libs e ignora o FFmpeg do sistema.
+    log_warning "Pacotes WineHQ requerem libavcodec.so.61 (FFmpeg 6.x) ausente no Fedora ${FEDORA_VERSION}."
+    log_warning "Plano C: instalando Wine via Flatpak (runtime isolado, sem conflito de FFmpeg)..."
+
+    if ! command -v flatpak &> /dev/null; then
+        log_info "Instalando flatpak..."
+        sudo dnf install -y flatpak
+    fi
+
+    # Garante repositório Flathub
+    if ! flatpak remotes | grep -q flathub; then
+        log_info "Adicionando repositório Flathub..."
+        sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+    fi
+
+    log_info "Instalando Wine via Flatpak (org.winehq.Wine)..."
+    if flatpak install -y flathub org.winehq.Wine; then
+        log_success "Wine instalado via Flatpak com sucesso!"
+        echo ""
+        log_info "Para usar o Wine Flatpak, substitua 'wine' por:"
+        echo "  flatpak run org.winehq.Wine seu_programa.exe"
+        echo ""
+        log_info "Atalho: adicione ao ~/.bashrc:"
+        echo "  alias wine='flatpak run org.winehq.Wine'"
+        return 0
+    fi
+
+    log_warning "Não foi possível instalar Wine 10.x automaticamente com os repositórios atuais."
+    return 1
 }
 
 # Método 2: Workaround com winetricks (se o método 1 falhar)
@@ -205,7 +335,7 @@ main() {
     echo ""
     log_warning "Este script irá:"
     echo "  1. Remover versões problemáticas do Wine"
-    echo "  2. Fazer backup do seu prefixo ~/.wine (se existir)"
+    echo "  2. Perguntar se deve fazer backup do seu prefixo ~/.wine (se existir)"
     echo "  3. Instalar versão corrigida do Wine"
     echo "  4. Aplicar workaround como fallback"
     echo ""
@@ -238,6 +368,18 @@ main() {
         
         if apply_winetricks_workaround; then
             clean_wine_cache
+            if is_problematic_wine; then
+                log_warning "Workaround aplicado, mas o Wine continua em 11.0 Staging."
+
+                if install_wine_10_fallback; then
+                    clean_wine_cache
+                    log_success "Fallback automático aplicado com sucesso!"
+                else
+                    log_warning "Tente instalar manualmente uma versão diferente (winehq-devel ou wine-10.x)."
+                    exit 1
+                fi
+            fi
+
             log_success "Workaround aplicado com sucesso!"
         else
             log_error "Não foi possível corrigir o problema automaticamente."
